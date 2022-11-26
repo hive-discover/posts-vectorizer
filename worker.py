@@ -17,6 +17,8 @@ LANGUAGE = os.environ["LANGUAGE"]
 SPACY_MODEL_NAME = ({ "en" : "en_core_web_sm", "es" : "es_core_news_sm", "de" : "de_core_news_sm"})[LANGUAGE]
 nlp = spacy.load(SPACY_MODEL_NAME)
 
+JOB_NAME = "jobs.vectorizer_" + LANGUAGE
+
 total_posts_found = {} # {target : total_posts_found}
 
 def get_text_lang(target : str, _id : int):
@@ -85,16 +87,16 @@ def process_post(target : str, _id : int) -> UpdateOne:
     return UpdateOne(
         {"_id": _id}, 
         {"$set": {
-            "doc_vectors": {LANGUAGE: doc_vector.tobytes() if token_count > 0 else None}, 
-            "known_tokens_ration" : (known_tokens / token_count if token_count > 0 else 0), 
-            "jobs.vectorizer": True
+            "doc_vectors": {LANGUAGE: doc_vector.tobytes() if known_tokens > 0 else None}, 
+            "known_tokens_ratio" : (known_tokens / token_count if token_count > 0 else 0), 
+            JOB_NAME : True
         }}
     )
 
 def get_batch(target : str) -> list:
     """Get a batch of posts to process"""
     # Prepare the cursor
-    cursor = mongo_client["hive"][target].find({"jobs.vectorizer": {"$ne" : True}}, {"_id": 1})
+    cursor = mongo_client["hive"][target].find({JOB_NAME : {"$ne" : True}}, {"_id": 1})
     if cursor.count() == 0:
         return []    
 
