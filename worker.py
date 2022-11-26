@@ -1,142 +1,152 @@
-from math import ceil
-import requests
-from multiprocessing.pool import ThreadPool
+import os
 import time
-from datetime import datetime
-import weaviate
-import uuid
-
+from pymongo import MongoClient, UpdateOne
+import spacy
+import concurrent.futures
+import requests
 import numpy as np
-from config import *
-from tf_idf_processing import TfIdfProcessor
+from random import randint, choice
 
-weaviate_client = weaviate.Client(os.environ.get("WEAVIATE_HOST", None), additional_headers={"Authorization" : os.environ.get("WEAVIATE_AUTH", None)})
+mongo_client = MongoClient(os.environ["MONGO_URI"])
 
-BATCH_SIZE = 25
-CONCURRENT_PROCESSES = 3
-TOTAL_POSTS_FOUND = 0
-WORKER_FIND_QUERY = {
-        "size" : str(BATCH_SIZE),
-        "query" : {
-            "bool" : {
-                "must" : [
-                    {"exists" : {"field" : "text_title"}},
-                    {"exists" : {"field" : "text_body"}},
-                    {"nested" : {
-                        "path" : "jobs",
-                        "query" : {
-                            "bool" : {
-                                # Find items which got not processed yet
-                                "must_not" : [
-                                    {"term" : {"jobs.vectorizer" : True}},                          
-                                ],       
-                                # Lang has to be calculated
-                                "must" : [
-                                    {"term" : {"jobs.lang_detected" : True}},                          
-                                ],                
-                            }
-                        }
-                    }}
-                ]
-            }
-        },
-       "_source" : {
-           "includes" : ["timestamp", "author", "permlink", "parent_permlink", "tags"]
-       }
-    }
+BATCH_SIZE = os.environ.get("BATCH_SIZE", 10)
+LANG_DETECTOR_URI = os.environ["LANG_DETECTOR_URI"]
+VECTORIZER_HEARTBEAT_URL = os.environ.get("VECTORIZER_HEARTBEAT_URL", None)
 
-os_client = get_opensearch_client()
+LANGUAGE = os.environ["LANGUAGE"]
+SPACY_MODEL_NAME = ({ "en" : "en_core_web_sm", "es" : "es_core_news_sm", "de" : "de_core_news_sm"})[LANGUAGE]
+nlp = spacy.load(SPACY_MODEL_NAME)
 
-def get_batch() -> list:
-    global TOTAL_POSTS_FOUND
-    results = os_client.search(index="hive-posts", body=WORKER_FIND_QUERY, timeout="60s")
-    TOTAL_POSTS_FOUND = results['hits']['total']["value"]
-    return results['hits']['hits']
+total_posts_found = {} # {target : total_posts_found}
 
-def proces_one(post_item : tuple) -> list:
-    ''''Process one post and return the bulk-update list'''
-    # Calculate doc-vectors for each lang in post
-    post_id, post_index, post_dict = post_item
-    tfidf_processor = TfIdfProcessor(post_id, start=True)
-    lang_doc_vectors = tfidf_processor.get_lang_vectors() # {lang: vector}
-    known_total_ratio = tfidf_processor.known_total_ratio
+def get_text_lang(target : str, _id : int):
+    """Get the language and text from the lang-detector"""
+    resp = requests.get(LANG_DETECTOR_URI + "/" + target + "/" + str(_id) + "?filter=" + LANGUAGE)
+    if resp.status_code == 200:
+        text = resp.json()["text"] # [ sentence1, sentence2, ... ]
+        return ' '.join(text)
 
-    # Create update document for OpenSearch
-    doc = {"jobs" : {"vectorizer" : True}, "known_total_ratio" : known_total_ratio, "doc_vector" : {}}
-    for lang in SUPPORTED_LANGS:
-        if lang in lang_doc_vectors:
-            doc["doc_vector"][lang] = lang_doc_vectors[lang].tolist()
-        else: 
-            doc["doc_vector"][lang] = None # Empty lang ==> null   
+    raise Exception("Could not get text from lang-detector: " + str(resp.status_code) + " " + resp.text)
 
-    # Add this post to weaviate (in a batch)
-    weave_doc = {
-        "author" : post_dict["author"],
-        "permlink" : post_dict["permlink"],
-        "os_id" : post_id,
-        "parent_permlink" : post_dict["parent_permlink"],
-        "tags" : post_dict["tags"],
-        "timestamp" : post_dict["timestamp"] + "Z"    
-    }
+def calc_tf_of_text(text : str) -> tuple:
+    """Calculate the tf of a text"""
+    tokens = nlp(text.lower())
+    tf = {}
 
-    if "en" in lang_doc_vectors and lang_doc_vectors["en"] is not None:
-        weave_doc["known_total_ratio"] = known_total_ratio["en"]
-        weave_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"{weave_doc['author']}/{weave_doc['permlink']}")
-        weaviate_client.batch.add_data_object(weave_doc, "HivePostsEnVectors", weave_uuid, vector=lang_doc_vectors["en"].tolist())
+    if len(tokens) == 0:
+        return tf, 0
 
-    return [
-        {"update" : {"_id" : post_id, "_index" : post_index}},
-        {"doc" : doc}
-    ]
+    # Count occurences of each token
+    for token in tokens:
+        if token.text in tf:
+            tf[token.text] += 1
+        else:
+            tf[token.text] = 1
 
-def process_batch() -> int:
-    # Get work and remap it to list of just ids
-    data_batch = get_batch()
-    batch_of_work = [(post['_id'], post['_index'], post['_source']) for post in data_batch]
+    # Calculate the tf
+    for token in tf:
+        tf[token] /= len(tokens)
 
-    # Process batch and get update_bulk
-    update_bulk = []
-    with ThreadPool(CONCURRENT_PROCESSES) as pool:
-        # Get thread results, flat it and add to update_bulk
-        task_results = pool.map(proces_one, batch_of_work)
-        task_results = [j for i in task_results for j in i]
-        update_bulk += task_results
+    return tf, len(tokens)
 
-    # Send update_bulk to OS and flush Weaviate Batch
-    if len(update_bulk) > 0:
-        res = os_client.bulk(body=update_bulk, refresh="wait_for", timeout="60s")
-        weaviate_client.batch.flush()
-        return len(update_bulk)
-        
-    return 0
+def get_wordvecs(tokens : list) -> dict:
+    """Get the word-vectors for the tokens"""
+    # Prepare the cursor
+    cursor = mongo_client["fasttext"]["word-vectors-" + LANGUAGE].find({"_id": {"$in": tokens}}, {"_id": 1, "vector": 1, "idf" : 1})
+    
+    # Retrieve the word-vectors
+    wordvecs = {} # {token : {vector : wordvec, idf : idf-score}}
+    for doc in cursor:
+        wordvecs[doc["_id"]] = {
+            "idf" : doc["idf"],
+            "vector" : np.frombuffer(doc["vector"], dtype=np.float32)
+        }
 
-def send_heartbeat(elapsed_time : int = 0) -> None:
-    params = {'msg': 'OK', 'ping' : elapsed_time}
+    return wordvecs
 
-    if HEARTBEAT_URL is not None:
+def process_post(target : str, _id : int) -> UpdateOne:
+    """Process a post and return an UpdateOne for MongoDB"""
+    # Get all the required information
+    text = get_text_lang(target, _id)
+    tf_dict, token_count = calc_tf_of_text(text)
+    wordvecs = get_wordvecs(list(tf_dict.keys()))
+
+    # Calculate the tf-idf
+    known_tokens = 0
+    doc_vector = np.zeros(300, dtype=np.float32)
+    for token in tf_dict:
+        if token not in wordvecs:
+            continue
+
+        doc_vector += tf_dict[token] * wordvecs[token]["idf"] * wordvecs[token]["vector"]
+        known_tokens += 1
+
+    # Return the UpdateOne
+    return UpdateOne(
+        {"_id": _id}, 
+        {"$set": {
+            "doc_vectors": {LANGUAGE: doc_vector.tobytes() if token_count > 0 else None}, 
+            "known_tokens_ration" : (known_tokens / token_count if token_count > 0 else 0), 
+            "jobs.vectorizer": True
+        }}
+    )
+
+def get_batch(target : str) -> list:
+    """Get a batch of posts to process"""
+    # Prepare the cursor
+    cursor = mongo_client["hive"][target].find({"jobs.vectorizer": {"$ne" : True}}, {"_id": 1})
+    if cursor.count() == 0:
+        return []    
+
+    # randomly select BATCH_SIZE posts
+    total_posts_found[target] = cursor.count()
+    if total_posts_found[target] > (BATCH_SIZE * 4):
+        cursor.skip(randint(0, total_posts_found[target] - BATCH_SIZE))
+
+    return list(cursor.limit(BATCH_SIZE))
+    
+def process_batch() -> tuple:
+    target = choice(["replies", "comments"])
+    batch = get_batch(target)
+    if len(batch) == 0:
+        return 0, target
+
+    # Process the batch
+    bulk_updates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+        results = executor.map(process_post, [target] * len(batch), [doc["_id"] for doc in batch])
+        bulk_updates = list(results)
+
+    # Update the database
+    if len(bulk_updates) > 0:
+        mongo_client["hive"][target].bulk_write(bulk_updates, ordered=False)
+
+    return len(bulk_updates), target
+
+def send_heartbeat(elapsed_ms : int):
+    """Send a heartbeat to the monitoring"""
+    params = {'msg': 'OK', 'ping' : elapsed_ms}
+
+    if VECTORIZER_HEARTBEAT_URL is not None:
         try:
-            requests.get(HEARTBEAT_URL, params=params)
+            requests.get(VECTORIZER_HEARTBEAT_URL, params=params)
         except Exception as e:
             print("CANNOT SEND HEARTBEAT: ")
             print(e)
 
-def run():
-
+def main():
     while True:
-        # Do Work and measure time
-        start_time = time.time()
-        counter = process_batch()
-        elapsed_time = time.time() - start_time
+        start = time.time()
+        processed, target = process_batch()
+        elapsed = time.time() - start
+        send_heartbeat(elapsed * 1000)
 
-        # Send heartbeat and print stats
-        send_heartbeat(elapsed_time * 1000)  
-        if counter > 0:
-            print("Processed {}/{} posts in {:.2f} seconds".format(counter, TOTAL_POSTS_FOUND, elapsed_time))
-        else:
-            # Sleep only when we have no posts left to process
-            time.sleep(8)
+        if processed == 0:
+            time.sleep(5)
+            continue
+
+        print(f"Processed {processed}/{total_posts_found[target]} {target} in {elapsed:.2f}s")
+
 
 if __name__ == '__main__':
-    run()
-
-# docker run --env-file V:\Projekte\HiveDiscover\Python\docker_variables.env registry.hive-discover.tech/vectorizer:0.1.7
+    main()

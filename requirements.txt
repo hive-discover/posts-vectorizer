@@ -1,5 +1,4 @@
 requests==2.25.1
-opensearch-py==1.1.0
 spacy==3.3.0
-tqdm==4.59.0
-weaviate-client
+pymongo==3.11.2
+numpy==1.21.0
